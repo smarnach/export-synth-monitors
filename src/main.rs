@@ -1,11 +1,9 @@
+use anyhow::{Context, Result};
+use futures::{stream::FuturesUnordered, TryStreamExt};
+use nerdgraph::Client;
 use std::fs::File;
 
-use anyhow::{Context, Result};
-use tokio::task::spawn;
-use serde::de::DeserializeOwned;
-use serde_json::json;
-
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let api_key = std::env::var("NEWRELIC_API_KEY")?;
     export(Box::leak(api_key.into_boxed_str())).await?;
@@ -13,26 +11,24 @@ async fn main() -> Result<()> {
 }
 
 async fn export(api_key: &'static str) -> Result<()> {
-    let response: monitor::Response = query_nerdgraph(monitor::QUERY, "", api_key).await?;
+    let client = Client::new(api_key);
+    let response: monitor::Response = client.query(monitor::QUERY, "").await?;
     let entities = response.data.actor.entity_search.results.entities;
     let csv_file = File::create("output/monitor.csv").context("CSV file creation failed")?;
     let mut wtr = csv::Writer::from_writer(csv_file);
-    let mut js_tasks = vec![];
+    let exports = FuturesUnordered::new();
     for entity in entities {
         if entity.monitor_type.starts_with("SCRIPT") {
-            js_tasks.push(spawn(export_js(entity.clone(), api_key)));
+            exports.push(export_js(client.clone(), entity.clone()));
         }
         wtr.serialize(monitor::Monitor::from(entity))?;
     }
     wtr.flush()?;
-    for task in js_tasks {
-        task.await??;
-    }
-    Ok(())
+    exports.try_collect().await
 }
 
-async fn export_js(entity: monitor::Entity, api_key: &str) -> Result<()> {
-    let js = script::get(entity.account_id, &entity.guid, api_key).await?;
+async fn export_js(client: Client<'static>, entity: monitor::Entity) -> Result<()> {
+    let js = script::get(&client, entity.account_id, &entity.guid).await?;
     let name = entity.name.replace('/', "_");
     std::fs::write(format!("output/scripts/{name}.js"), js)?;
     Ok(())
@@ -140,10 +136,11 @@ mod monitor {
 }
 
 mod script {
+    use super::nerdgraph::Client;
     use anyhow::{Error, Result};
     use serde_json::Value;
 
-    pub async fn get(account_id: u32, guid: &str, api_key: &str) -> Result<String> {
+    pub async fn get(client: &Client<'_>, account_id: u32, guid: &str) -> Result<String> {
         let query = format!(
             r#"{{
           actor {{
@@ -157,7 +154,7 @@ mod script {
           }}
         }}"#
         );
-        let mut response: Value = super::query_nerdgraph(&query, "", api_key).await?;
+        let mut response: Value = client.query(&query, "").await?;
         loop {
             response = match response {
                 Value::Object(map) => map.into_iter().next().unwrap().1,
@@ -171,17 +168,4 @@ mod script {
     }
 }
 
-async fn query_nerdgraph<T: DeserializeOwned>(
-    query: &str,
-    variables: &str,
-    api_key: &str,
-) -> Result<T> {
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.newrelic.com/graphql")
-        .header("API-Key", api_key)
-        .json(&json!({"query": query, "variables": variables}))
-        .send()
-        .await?;
-    Ok(response.json().await?)
-}
+mod nerdgraph;
